@@ -8,6 +8,7 @@ import torch
 from os import path as osp
 import sys
 import os
+from tqdm import tqdm  # 新增导入
 #current_dir = os.path.dirname(os.path.realpath(__file__))
 #sys.path.remove(current_dir.replace('/realDenoising/basicsr',''))
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -230,6 +231,8 @@ def main():
     scale = opt['scale']
 
     epoch = start_epoch
+    # 初始化tqdm进度条
+    pbar = tqdm(total=total_iters, initial=current_iter, desc='Training Progress', ncols=100)
     while current_iter <= total_iters:
         train_sampler.set_epoch(epoch)
         prefetcher.reset()
@@ -239,6 +242,12 @@ def main():
             data_time = time.time() - data_time
 
             current_iter += 1
+            pbar.update(1)  # 每次迭代更新进度条
+            # 可选：显示当前epoch和iter
+            pbar.set_postfix({
+                'epoch': epoch,
+                'iter': current_iter
+            })
             if current_iter > total_iters:
                 break
             # update learning rate
@@ -309,6 +318,7 @@ def main():
             train_data = prefetcher.next()
         # end of iter
         epoch += 1
+    pbar.close()  # 训练结束关闭进度条
 
     # end of epoch
 
