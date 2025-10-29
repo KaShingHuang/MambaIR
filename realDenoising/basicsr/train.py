@@ -10,7 +10,11 @@ import sys
 import os
 #current_dir = os.path.dirname(os.path.realpath(__file__))
 #sys.path.remove(current_dir.replace('/realDenoising/basicsr',''))
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.abspath(os.path.join(current_dir, '..'))
 
+# Add the parent directory to sys.path
+sys.path.append(parent_dir)
 from basicsr.data import create_dataloader, create_dataset
 from basicsr.data.data_sampler import EnlargedSampler
 from basicsr.data.prefetch_dataloader import CPUPrefetcher, CUDAPrefetcher
