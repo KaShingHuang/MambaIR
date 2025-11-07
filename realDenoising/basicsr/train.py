@@ -26,7 +26,7 @@ from basicsr.utils import (MessageLogger, check_resume, get_env_info,
                            set_random_seed)
 from basicsr.utils.dist_util import get_dist_info, init_dist
 from basicsr.utils.options import dict2str, parse
-
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 import numpy as np
 
 def parse_options(is_train=True):

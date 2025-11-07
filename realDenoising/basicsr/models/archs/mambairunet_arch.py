@@ -431,14 +431,67 @@ class OverlapPatchEmbed(nn.Module):
         return x
 
 
-##########################################################################
-## Resizing modules
-class Downsample(nn.Module):
-    def __init__(self, n_feat):
-        super(Downsample, self).__init__()
+# ====== 新增：频域模块与空间缩放模块（清理替换，避免重复/破损代码） ======
+class FFTPrior(nn.Module):
+    """频域先验：rfft2 -> 频域实/虚拼接 -> 实值网络 -> irfft2 -> 残差回加"""
+    def __init__(self, channels, hidden_channels=None):
+        super().__init__()
+        in_ch = channels * 2
+        hidden_channels = hidden_channels or max(32, in_ch)
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, hidden_channels, kernel_size=3, padding=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels, in_ch, kernel_size=1, padding=0, bias=True),
+        )
+        self.scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
 
-        self.body = nn.Sequential(nn.Conv2d(n_feat, n_feat // 2, kernel_size=3, stride=1, padding=1, bias=False),
-                                  nn.PixelUnshuffle(2))
+    def forward(self, x):
+        B, C, H, W = x.shape
+        Xf = torch.fft.rfft2(x, norm='ortho')  # (B, C, H, W2)
+        real = Xf.real
+        imag = Xf.imag
+        feat = torch.cat([real, imag], dim=1)  # (B, 2C, H, W2)
+        feat_out = self.net(feat)
+        real_out, imag_out = feat_out[:, :C], feat_out[:, C:]
+        Xf_mod = torch.complex(real_out, imag_out)
+        x_rec = torch.fft.irfft2(Xf_mod, s=(H, W), norm='ortho')
+        return x + self.scale * x_rec
+
+
+class FFTAttention(nn.Module):
+    """频域注意力：学习频谱掩码并对复频谱做乘性缩放，返回时域恢复结果"""
+    def __init__(self, channels, hidden_channels=None, clamp_scale=2.0):
+        super().__init__()
+        in_ch = channels * 2
+        hidden_channels = hidden_channels or max(32, in_ch)
+        self.mask_net = nn.Sequential(
+            nn.Conv2d(in_ch, hidden_channels, kernel_size=3, padding=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels, channels, kernel_size=1, padding=0, bias=True),
+        )
+        self.clamp_scale = float(clamp_scale)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        Xf = torch.fft.rfft2(x, norm='ortho')
+        real = Xf.real
+        imag = Xf.imag
+        feat = torch.cat([real, imag], dim=1)
+        mask = torch.sigmoid(self.mask_net(feat))  # (B,C,H,W2)
+        m = (mask * 2.0 - 1.0) * (self.clamp_scale - 1.0) + 1.0
+        Xf_mod = torch.complex(real * m, imag * m)
+        x_rec = torch.fft.irfft2(Xf_mod, s=(H, W), norm='ortho')
+        return x_rec
+
+
+class Downsample(nn.Module):
+    """从 token 表示 (B, HW, C) 下采样到空间大小减半、通道加倍的表示"""
+    def __init__(self, n_feat):
+        super().__init__()
+        # 使用 stride=2 的卷积在空间上降采样并扩大通道
+        self.body = nn.Conv2d(n_feat, n_feat * 2, kernel_size=3, stride=2, padding=1, bias=False)
 
     def forward(self, x, H, W):
         x = rearrange(x, "b (h w) c -> b c h w", h=H, w=W).contiguous()
@@ -448,18 +501,18 @@ class Downsample(nn.Module):
 
 
 class Upsample(nn.Module):
+    """从 token 表示 (B, HW, C) 上采样到空间大小放大两倍、通道减半的表示"""
     def __init__(self, n_feat):
-        super(Upsample, self).__init__()
-
-        self.body = nn.Sequential(nn.Conv2d(n_feat, n_feat * 2, kernel_size=3, stride=1, padding=1, bias=False),
-                                  nn.PixelShuffle(2))
+        super().__init__()
+        out_ch = max(1, n_feat // 2)
+        # 使用 ConvTranspose2d 做上采样并减少通道
+        self.body = nn.ConvTranspose2d(n_feat, out_ch, kernel_size=2, stride=2, bias=False)
 
     def forward(self, x, H, W):
         x = rearrange(x, "b (h w) c -> b c h w", h=H, w=W).contiguous()
         x = self.body(x)
         x = rearrange(x, "b c h w -> b (h w) c").contiguous()
         return x
-
 
 
 class MambaIRUNet(nn.Module):
@@ -472,12 +525,24 @@ class MambaIRUNet(nn.Module):
                  num_refinement_blocks=4,
                  drop_path_rate=0.,
                  bias=False,
-                 dual_pixel_task=False  ## True for dual-pixel defocus deblurring only. Also set inp_channels=6
+                 dual_pixel_task=True,  ## True for dual-pixel defocus deblurring only. Also set inp_channels=6
+                 use_fft_prior=True,
+                 use_fft_attention=True
                  ):
 
         super(MambaIRUNet, self).__init__()
         self.mlp_ratio = mlp_ratio
         self.patch_embed = OverlapPatchEmbed(inp_channels, dim)
+        # 可选的频域先验模块（不启用则为 None）
+        self.use_fft_prior = use_fft_prior
+        self.fft_prior = FFTPrior(dim) if use_fft_prior else None
+        # 可选的频域注意力（在 latent 使用）
+        self.use_fft_attention = use_fft_attention
+        latent_channels = int(dim * 2 ** 3)
+        self.fft_attention = FFTAttention(latent_channels) if use_fft_attention else None
+        if use_fft_attention:
+            self.fft_att_scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
+
         base_d_state = 4
         self.encoder_level1 = nn.ModuleList([
             VSSBlock(
@@ -486,7 +551,7 @@ class MambaIRUNet(nn.Module):
                 norm_layer=nn.LayerNorm,
                 attn_drop_rate=0,
                 expand=self.mlp_ratio,
-                d_state=base_d_state* 2 ** 2,
+                d_state=base_d_state * 2 ** 2,
             )
             for i in range(num_blocks[0])])
 
@@ -588,6 +653,13 @@ class MambaIRUNet(nn.Module):
 
         _, _, H, W = inp_img.shape
         inp_enc_level1 = self.patch_embed(inp_img)  # b,hw,c
+
+        # 可选：在 patch_embed 后应用频域先验
+        if self.use_fft_prior and (self.fft_prior is not None):
+            tmp = rearrange(inp_enc_level1, "b (h w) c -> b c h w", h=H, w=W).contiguous()
+            tmp = self.fft_prior(tmp)
+            inp_enc_level1 = rearrange(tmp, "b c h w -> b (h w) c").contiguous()
+
         out_enc_level1 = inp_enc_level1
         for layer in self.encoder_level1:
             out_enc_level1 = layer(out_enc_level1, [H, W])
@@ -606,6 +678,13 @@ class MambaIRUNet(nn.Module):
         latent = inp_enc_level4
         for layer in self.latent:
             latent = layer(latent, [H // 8, W // 8])
+
+        # 可选：在 latent 应用频域注意力（乘性掩码），结果作为残差回加
+        if self.use_fft_attention and (self.fft_attention is not None):
+            latent_sp = rearrange(latent, "b (h w) c -> b c h w", h=H // 8, w=W // 8).contiguous()
+            att_out = self.fft_attention(latent_sp)  # (B, C, h, w)
+            latent_sp = latent_sp + self.fft_att_scale * att_out
+            latent = rearrange(latent_sp, "b c h w -> b (h w) c").contiguous()
 
         inp_dec_level3 = self.up4_3(latent, H // 8, W // 8)  # b, hw//16, 4c
         inp_dec_level3 = torch.cat([inp_dec_level3, out_enc_level3], 2)
